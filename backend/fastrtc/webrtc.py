@@ -142,7 +142,7 @@ class WebRTC(Component, WebRTCConnectionMixin):
         self.height = height
         self.width = width
         self.mirror_webcam = mirror_webcam
-        self.concurrency_limit = 1
+        self.concurrency_limit = 3
         self.rtc_configuration = rtc_configuration
         self.mode = mode
         self.modality = modality

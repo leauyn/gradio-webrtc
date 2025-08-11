@@ -107,6 +107,7 @@ class WebRTCConnectionMixin:
     def clean_up(self, webrtc_id: str):
         self.handlers.pop(webrtc_id, None)
         self.connection_timeouts.pop(webrtc_id, None)
+        self.pcs.pop(webrtc_id, None)
         connection = self.connections.pop(webrtc_id, [])
         for conn in connection:
             if isinstance(conn, AudioCallback):
@@ -149,6 +150,36 @@ class WebRTCConnectionMixin:
             self.additional_outputs[webrtc_id].queue.put_nowait(outputs)
 
         return set_outputs
+
+    def force_cleanup_all_connections(self):
+        """强制清理所有现有连接，用于解决并发限制问题"""
+        logger.info(f"Force cleaning up {len(self.pcs)} existing connections...")
+        
+        # 关闭所有PeerConnection
+        for webrtc_id, pc in list(self.pcs.items()):
+            try:
+                asyncio.create_task(pc.close())
+                logger.debug(f"Closing connection {webrtc_id}")
+            except Exception as e:
+                logger.warning(f"Error closing connection {webrtc_id}: {e}")
+        
+        # 清理所有连接数据
+        webrtc_ids_to_clean = list(self.pcs.keys())
+        for webrtc_id in webrtc_ids_to_clean:
+            try:
+                self.clean_up(webrtc_id)
+            except Exception as e:
+                logger.warning(f"Error cleaning up connection {webrtc_id}: {e}")
+        
+        # 确保所有字典都被清空
+        self.pcs.clear()
+        self.connections.clear()
+        self.handlers.clear()
+        self.data_channels.clear()
+        self.connection_timeouts.clear()
+        self.additional_outputs.clear()
+        
+        logger.info("All connections forcefully cleaned up")
 
     async def handle_offer(self, body, set_outputs):
         logger.debug("Starting to handle offer")
@@ -230,17 +261,12 @@ class WebRTCConnectionMixin:
                 content={"status": "failed", "meta": {"error": "connection_closed"}},
             )
 
-        if len(self.connections) >= cast(int, self.concurrency_limit):
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "failed",
-                    "meta": {
-                        "error": "concurrency_limit_reached",
-                        "limit": self.concurrency_limit,
-                    },
-                },
-            )
+        if len(self.pcs) >= cast(int, self.concurrency_limit):
+            # 强制清理所有现有连接以允许新连接
+            logger.warning(f"Concurrency limit reached ({len(self.pcs)}/{self.concurrency_limit}), force cleaning up all connections")
+            self.force_cleanup_all_connections()
+            # 稍等一下让清理完成
+            await asyncio.sleep(0.1)
 
         offer = RTCSessionDescription(sdp=body["sdp"], type=body["type"])
 

@@ -10,6 +10,38 @@
   export let audio_source_callback
   export let wave_color
   export let assetLoaded = true
+  export let loadingProgress = 0
+  
+  // 添加前端清理逻辑
+  async function handleStartChat() {
+    // 如果已有连接，先强制结束
+    if (stream_state === "open" || stream_state === "waiting") {
+      console.log("Forcing cleanup of existing connection before starting new one");
+      
+      // 发送清理信号给服务器
+      try {
+        const response = await fetch('/cleanup_connections', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({action: 'force_cleanup'})
+        });
+        
+        if (response.ok) {
+          console.log("Server connections cleaned up successfully");
+        }
+      } catch (error) {
+        console.warn("Failed to cleanup server connections:", error);
+      }
+      
+      // 等待一下让服务器清理完成
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    
+    // 调用原始的开始聊天函数
+    onStartChat();
+  }
 </script>
 
 <div class="player-controls">
@@ -19,7 +51,7 @@
     class="chat-btn"
     class:start-chat={stream_state === "closed"}
     class:stop-chat={stream_state === "open" && assetLoaded === true}
-    on:click={onStartChat}
+    on:click={handleStartChat}
   >
     {#if stream_state === "closed"}
       <span>点击开始对话</span>
@@ -28,7 +60,11 @@
         <div class="icon" title="spinner">
           <Spinner />
         </div>
-        <span>等待中</span>
+        {#if loadingProgress > 0 && loadingProgress < 100}
+          <span>加载中 {Math.round(loadingProgress)}%</span>
+        {:else}
+          <span>连接中</span>
+        {/if}
       </div>
     {:else}
       <div class="stop-chat-inner"></div>
