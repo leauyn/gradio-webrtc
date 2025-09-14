@@ -22,7 +22,7 @@
     on:click={onStartChat}
   >
     {#if stream_state === "closed"}
-      <span>点击开始对话</span>
+      <span>please点击开始对话</span>
     {:else if stream_state === "waiting" || assetLoaded === false}
       <div class="waiting-icon-text">
         <div class="icon" title="spinner">
