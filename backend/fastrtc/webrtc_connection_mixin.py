@@ -216,6 +216,14 @@ class WebRTCConnectionMixin:
     async def handle_offer(self, body, set_outputs):
         logger.debug("Starting to handle offer")
         logger.debug("Offer body %s", body)
+        
+        # 详细排查请求体内容
+        logger.info(f"🔍 WebRTC handle_offer 请求体排查:")
+        logger.info(f"  - body类型: {type(body)}")
+        logger.info(f"  - body内容: {body}")
+        logger.info(f"  - body中的userId: {body.get('userId', 'NOT_FOUND')}")
+        logger.info(f"  - body中的webrtc_id: {body.get('webrtc_id', 'NOT_FOUND')}")
+        logger.info(f"  - body中的type: {body.get('type', 'NOT_FOUND')}")
 
         if body.get("type") == "ice-candidate" and "candidate" in body:
             webrtc_id = body.get("webrtc_id")
@@ -329,7 +337,6 @@ class WebRTCConnectionMixin:
                 handler.video_emit = webrtc_error_handler(handler.video_emit)  # type: ignore
             if hasattr(handler, "on_pc_connected"):
                 handler.on_pc_connected(body["webrtc_id"])
-
         elif isinstance(self.event_handler, VideoStreamHandler):
             self.event_handler.callable = cast(
                 VideoEventHandler, webrtc_error_handler(self.event_handler.callable)
@@ -337,6 +344,47 @@ class WebRTCConnectionMixin:
             handler = self.event_handler
         else:
             handler = webrtc_error_handler(cast(Callable, self.event_handler))
+
+        # 设置用户ID到处理器
+        # logger.info(f"🔍 WebRTC 用户ID设置排查开始:")
+        # logger.info(f"  - body中的userId: {body.get('userId', 'NOT_FOUND')}")
+        # logger.info(f"  - hasattr(handler, 'user_id'): {hasattr(handler, 'user_id')}")
+        # logger.info(f"  - 'userId' in body: {'userId' in body}")
+        
+        # 尝试从body获取用户ID
+        user_id = body.get('userId')
+        
+        # 如果body中没有用户ID，尝试从存储中获取
+        if not user_id and 'webrtc_id' in body:
+            try:
+                import sys
+                import os
+                # 添加项目根目录到Python路径
+                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../..'))
+                if project_root not in sys.path:
+                    sys.path.insert(0, project_root)
+                
+                from src.utils.user_id_storage import get_user_id
+                user_id = get_user_id(body['webrtc_id'])
+                if user_id:
+                    # logger.info(f"✅ 从存储中获取到用户ID: {user_id}")
+                    pass
+                else:
+                    logger.warning(f"⚠️ 存储中未找到用户ID: webrtc_id={body['webrtc_id']}")
+            except Exception as e:
+                logger.error(f"⚠️ 从存储获取用户ID失败: {e}")
+        
+        if hasattr(handler, 'user_id') and user_id:
+            old_user_id = getattr(handler, 'user_id', None)
+            handler.user_id = user_id
+            # logger.info(f"✅ 设置处理器用户ID: {old_user_id} -> {handler.user_id}")
+            
+            # 如果处理器有webrtc_id属性，也设置它
+            if hasattr(handler, 'webrtc_id') and 'webrtc_id' in body:
+                handler.webrtc_id = body['webrtc_id']
+                # logger.info(f"✅ 设置处理器WebRTC ID: {handler.webrtc_id}")
+        else:
+            logger.warning(f"⚠️ 无法设置处理器用户ID: hasattr={hasattr(handler, 'user_id')}, user_id={user_id}")
 
         self.handlers[body["webrtc_id"]] = handler
 
