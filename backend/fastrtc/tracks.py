@@ -771,11 +771,14 @@ class AudioCallback(AudioStreamTrack):
         return cast(Callable, self.event_handler.emit)()
 
     async def process_input_frames(self) -> None:
+        logger.info(f"[AUDIO_CALLBACK] 🎤 process_input_frames 启动: track={self.track.id if self.track else 'None'}, readyState={self.track.readyState if self.track else 'None'}")
         while not self.thread_quit.is_set():
             try:
                 frame = cast(AudioFrame, await self.track.recv())
+                logger.debug(f"[AUDIO_CALLBACK] 🎵 收到音频帧: sample_rate={frame.sample_rate if hasattr(frame, 'sample_rate') else 'unknown'}")
                 for frame in self.event_handler.resample(frame):
                     numpy_array = frame.to_ndarray()
+                    logger.debug(f"[AUDIO_CALLBACK] 🎵 处理音频帧: shape={numpy_array.shape}, sample_rate={frame.sample_rate}")
                     if isinstance(self.event_handler, AsyncHandler):
                         await self.event_handler.receive(
                             (frame.sample_rate, numpy_array)  # type: ignore
@@ -784,12 +787,18 @@ class AudioCallback(AudioStreamTrack):
                         await anyio.to_thread.run_sync(
                             self.event_handler_receive, (frame.sample_rate, numpy_array)
                         )
-            except MediaStreamError:
-                logger.debug("MediaStreamError in process_input_frames")
+            except MediaStreamError as e:
+                logger.warning(f"[AUDIO_CALLBACK] ⚠️ MediaStreamError in process_input_frames: {e}")
+                break
+            except Exception as e:
+                logger.error(f"[AUDIO_CALLBACK] ❌ Exception in process_input_frames: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
                 break
 
     async def start(self):
         if not self.has_started:
+            logger.info(f"[AUDIO_CALLBACK] 🚀 start() 被调用: track={self.track.id if self.track else 'None'}, readyState={self.track.readyState if self.track else 'None'}")
             loop = asyncio.get_running_loop()
             await self.wait_for_channel()
             if isinstance(self.event_handler, AsyncHandler):
@@ -805,9 +814,10 @@ class AudioCallback(AudioStreamTrack):
                     loop.run_in_executor, None, self.event_handler_emit
                 )
                 start_up = anyio.to_thread.run_sync(self.event_handler.start_up)
+            logger.info(f"[AUDIO_CALLBACK] ✅ 创建 process_input_frames 任务")
             self.process_input_task = asyncio.create_task(self.process_input_frames())
             self.process_input_task.add_done_callback(
-                lambda _: logger.debug("process_input_done")
+                lambda _: logger.info("[AUDIO_CALLBACK] ✅ process_input_frames 任务完成")
             )
             self.start_up_task = asyncio.create_task(start_up)
             self.start_up_task.add_done_callback(
@@ -830,13 +840,17 @@ class AudioCallback(AudioStreamTrack):
 
     async def recv(self):  # type: ignore
         try:
+            logger.debug(f"[AUDIO_CALLBACK] 📥 recv() 被调用: readyState={self.readyState}")
             if self.readyState != "live":
+                logger.warning(f"[AUDIO_CALLBACK] ⚠️ readyState 不是 live: {self.readyState}")
                 raise MediaStreamError
 
             if not self.event_handler.channel_set.is_set():
+                logger.debug(f"[AUDIO_CALLBACK] ⏳ 等待 channel_set...")
                 await self.event_handler.channel_set.wait()
             if current_channel.get() != self.event_handler.channel:
                 current_channel.set(self.event_handler.channel)
+            logger.debug(f"[AUDIO_CALLBACK] 🚀 调用 start()...")
             await self.start()
 
             frame = await self.queue.get()

@@ -270,9 +270,18 @@ class WebRTCConnectionMixin:
                             sdpMLineIndex=body["candidate"].get("sdpMLineIndex"),
                         )
 
-                        # Add the candidate to the peer connection
-                        await pc.addIceCandidate(ice_candidate)
-                        logger.debug(f"Added ICE candidate for {webrtc_id}")
+                        # ✅ 修复：在添加 ICE candidate 前检查 remote description 是否已设置
+                        try:
+                            await pc.addIceCandidate(ice_candidate)
+                            logger.debug(f"Added ICE candidate for {webrtc_id}")
+                        except AttributeError as e:
+                            # Remote description 尚未设置，这是正常的（ICE candidate 可能在 offer 之前到达）
+                            if "'NoneType' object has no attribute 'media'" in str(e):
+                                logger.debug(f"ICE candidate received before remote description set for {webrtc_id}, will be added later")
+                            else:
+                                logger.warning(f"Error adding ICE candidate for {webrtc_id}: {e}")
+                        except Exception as e:
+                            logger.warning(f"Error adding ICE candidate for {webrtc_id}: {e}")
                         return JSONResponse(
                             status_code=200, content={"status": "success"}
                         )
@@ -324,6 +333,78 @@ class WebRTCConnectionMixin:
 
         pc = RTCPeerConnection(configuration=self.server_rtc_configuration)
         self.pcs[body["webrtc_id"]] = pc
+        
+        # ✅ 关键修复：在创建 PC 后立即注册 track 事件监听器，防止 track 事件在注册前触发
+        @pc.on("track")
+        def _(track):
+            logger.info(f"[WEBRTC] 📡 track 事件触发: kind={track.kind}, id={track.id}, readyState={track.readyState}, modality={self.modality}")
+            # 从 self.handlers 获取 handler，如果还没有设置则记录警告
+            if body["webrtc_id"] not in self.handlers:
+                logger.warning(f"[WEBRTC] ⚠️ track 事件触发时 handler 尚未设置，webrtc_id={body['webrtc_id']}")
+                return
+            
+            relay = MediaRelay()
+            handler = self.handlers[body["webrtc_id"]]
+            context = Context(webrtc_id=body["webrtc_id"])
+            if self.modality == "video" and track.kind == "video":
+                args = {}
+                handler_ = handler
+                if isinstance(handler, VideoStreamHandler):
+                    handler_ = handler.callable
+                    args["fps"] = handler.fps
+                    args["skip_frames"] = handler.skip_frames
+                cb = VideoCallback(
+                    relay.subscribe(track),
+                    event_handler=cast(Callable, handler_),
+                    set_additional_outputs=set_outputs,
+                    mode=cast(Literal["send", "send-receive"], self.mode),
+                    context=context,
+                    **args,
+                )
+            elif self.modality == "audio-video" and track.kind == "video":
+                cb = VideoStreamHandler_(
+                    relay.subscribe(track),
+                    event_handler=handler,  # type: ignore
+                    set_additional_outputs=set_outputs,
+                    fps=cast(StreamHandlerImpl, handler).fps,
+                    context=context,
+                )
+            elif self.modality in ["audio", "audio-video"] and track.kind == "audio":
+                # ✅ 修复：RemoteStreamTrack 没有 enabled 属性，使用 getattr 安全访问
+                track_enabled = getattr(track, 'enabled', 'N/A')
+                track_label = getattr(track, 'label', 'N/A')
+                logger.info(f"[WEBRTC] 🎤 收到音频 track: id={track.id}, enabled={track_enabled}, readyState={track.readyState}, label={track_label}")
+                eh = cast(StreamHandlerImpl, handler)
+                eh._loop = asyncio.get_running_loop()
+                subscribed_track = relay.subscribe(track)
+                logger.info(f"[WEBRTC] ✅ 创建 AudioCallback: subscribed_track={subscribed_track.id if subscribed_track else 'None'}")
+                cb = AudioCallback(
+                    subscribed_track,
+                    event_handler=eh,
+                    set_additional_outputs=set_outputs,
+                    context=context,
+                )
+                logger.info(f"[WEBRTC] ✅ AudioCallback 创建完成")
+            else:
+                if self.modality not in ["video", "audio", "audio-video"]:
+                    msg = "Modality must be either video, audio, or audio-video"
+                else:
+                    if self.allow_extra_tracks:
+                        return
+                    msg = f"Unsupported track kind '{track.kind}' for modality '{self.modality}'"
+                raise ValueError(msg)
+            if body["webrtc_id"] not in self.connections:
+                self.connections[body["webrtc_id"]] = []
+
+            self.connections[body["webrtc_id"]].append(cb)
+            if body["webrtc_id"] in self.data_channels:
+                for conn in self.connections[body["webrtc_id"]]:
+                    conn.set_channel(self.data_channels[body["webrtc_id"]])
+            if self.mode == "send-receive":
+                logger.debug("Adding track to peer connection %s", cb)
+                pc.addTrack(cb)
+            elif self.mode == "send":
+                asyncio.create_task(cast(AudioCallback | VideoCallback, cb).start())
 
         if isinstance(self.event_handler, StreamHandlerBase):
             handler = self.event_handler.copy(webrtc_id=body['webrtc_id'])
@@ -388,7 +469,6 @@ class WebRTCConnectionMixin:
 
         self.handlers[body["webrtc_id"]] = handler
 
-
         @pc.on("iceconnectionstatechange")
         async def on_iceconnectionstatechange():
             logger.debug("ICE connection state change %s", pc.iceConnectionState)
@@ -411,64 +491,6 @@ class WebRTCConnectionMixin:
                 self.connection_timeouts[body["webrtc_id"]].set()
                 if self.time_limit is not None:
                     asyncio.create_task(self.wait_for_time_limit(pc, self.time_limit))
-
-        @pc.on("track")
-        def _(track):
-            relay = MediaRelay()
-            handler = self.handlers[body["webrtc_id"]]
-            context = Context(webrtc_id=body["webrtc_id"])
-            if self.modality == "video" and track.kind == "video":
-                args = {}
-                handler_ = handler
-                if isinstance(handler, VideoStreamHandler):
-                    handler_ = handler.callable
-                    args["fps"] = handler.fps
-                    args["skip_frames"] = handler.skip_frames
-                cb = VideoCallback(
-                    relay.subscribe(track),
-                    event_handler=cast(Callable, handler_),
-                    set_additional_outputs=set_outputs,
-                    mode=cast(Literal["send", "send-receive"], self.mode),
-                    context=context,
-                    **args,
-                )
-            elif self.modality == "audio-video" and track.kind == "video":
-                cb = VideoStreamHandler_(
-                    relay.subscribe(track),
-                    event_handler=handler,  # type: ignore
-                    set_additional_outputs=set_outputs,
-                    fps=cast(StreamHandlerImpl, handler).fps,
-                    context=context,
-                )
-            elif self.modality in ["audio", "audio-video"] and track.kind == "audio":
-                eh = cast(StreamHandlerImpl, handler)
-                eh._loop = asyncio.get_running_loop()
-                cb = AudioCallback(
-                    relay.subscribe(track),
-                    event_handler=eh,
-                    set_additional_outputs=set_outputs,
-                    context=context,
-                )
-            else:
-                if self.modality not in ["video", "audio", "audio-video"]:
-                    msg = "Modality must be either video, audio, or audio-video"
-                else:
-                    if self.allow_extra_tracks:
-                        return
-                    msg = f"Unsupported track kind '{track.kind}' for modality '{self.modality}'"
-                raise ValueError(msg)
-            if body["webrtc_id"] not in self.connections:
-                self.connections[body["webrtc_id"]] = []
-
-            self.connections[body["webrtc_id"]].append(cb)
-            if body["webrtc_id"] in self.data_channels:
-                for conn in self.connections[body["webrtc_id"]]:
-                    conn.set_channel(self.data_channels[body["webrtc_id"]])
-            if self.mode == "send-receive":
-                logger.debug("Adding track to peer connection %s", cb)
-                pc.addTrack(cb)
-            elif self.mode == "send":
-                asyncio.create_task(cast(AudioCallback | VideoCallback, cb).start())
 
         context = Context(webrtc_id=body["webrtc_id"])
         if self.mode == "receive":
